@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">KittyMoeii</string>
+    <string name="camera_loading">正在获取摄像头画面…</string>
+    <string name="camera_refresh_hint">点击顶部画面可重新获取摄像头快照</string>
+    <string name="camera_search_failed">未搜索到摄像头，请确认手机和摄像头处于同一局域网</string>
+    <string name="camera_load_failed">摄像头已找到，但 HTTP 快照获取失败</string>
+    <string name="camera_load_success">摄像头画面获取成功</string>
 </resources>
