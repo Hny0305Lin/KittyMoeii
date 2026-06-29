@@ -28,7 +28,13 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     private static final String TAG = "MainActivity";
-    private static final boolean USE_RTSP_STREAM = true;
+    private enum PreviewProtocol {
+        HTTP,
+        RTSP
+    }
+
+    // 在这里统一切换摄像头预览协议: HTTP 或 RTSP。
+    private static final PreviewProtocol PREVIEW_PROTOCOL = PreviewProtocol.RTSP;
     private static final boolean FORCE_RTSP_INTERLEAVED_TCP = false;
     // 先尝试固定 IP，连不上时再回退到 UDP 搜索。
     private static final String DEFAULT_CAMERA_IP = "192.168.31.100";
@@ -103,11 +109,11 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     /**
      * 根据当前模式启动摄像头预览。
      *
-     * <p>当 {@link #USE_RTSP_STREAM} 为 {@code true} 时，使用 RTSP 串流；否则使用
-     * HTTP 快照轮询。</p>
+     * <p>当 {@link #PREVIEW_PROTOCOL} 为 {@link PreviewProtocol#RTSP} 时，使用 RTSP
+     * 串流；否则使用 HTTP 快照轮询。</p>
      */
     private void startPreview() {
-        if (USE_RTSP_STREAM) {
+        if (isRtspPreviewEnabled()) {
             startRtspPreview();
         } else {
             startCameraPreviewLoop();
@@ -118,7 +124,7 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
      * 停止当前模式下的摄像头预览。
      */
     private void stopPreview() {
-        if (USE_RTSP_STREAM) {
+        if (isRtspPreviewEnabled()) {
             stopRtspPreview();
         } else {
             stopCameraPreviewLoop();
@@ -126,12 +132,16 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     }
 
     /**
-     * 按当前布尔开关应用预览视图显示状态。
+     * 按当前预览协议应用视图显示状态。
      */
     private void applyPreviewMode() {
-        carImage.setVisibility(USE_RTSP_STREAM ? View.GONE : View.VISIBLE);
-        rtspPlayerView.setVisibility(USE_RTSP_STREAM ? View.VISIBLE : View.GONE);
+        carImage.setVisibility(isRtspPreviewEnabled() ? View.GONE : View.VISIBLE);
+        rtspPlayerView.setVisibility(isRtspPreviewEnabled() ? View.VISIBLE : View.GONE);
         setImageEnabled(true);
+    }
+
+    private boolean isRtspPreviewEnabled() {
+        return PREVIEW_PROTOCOL == PreviewProtocol.RTSP;
     }
 
     /**
