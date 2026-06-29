@@ -17,7 +17,7 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent">
 
-            <org.videolan.libvlc.util.VLCVideoLayout
+            <SurfaceView
                 android:id="@+id/rtspPlayerView"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"

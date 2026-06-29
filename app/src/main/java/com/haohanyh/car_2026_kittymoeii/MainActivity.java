@@ -4,6 +4,7 @@ import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.SurfaceView;
 import android.view.View;
 import android.widget.ImageView;
 import android.widget.Toast;
@@ -25,8 +26,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-import org.videolan.libvlc.util.VLCVideoLayout;
-
 public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     private static final String TAG = "MainActivity";
     private static final boolean USE_RTSP_STREAM = true;
@@ -36,7 +35,7 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     private static final String DEFAULT_CAR_IP = DEFAULT_CAMERA_IP;
     private static final long CAMERA_REFRESH_INTERVAL_MS = 120L;
     private static final long RTSP_RETRY_INTERVAL_MS = 2500L;
-    private static final long RTSP_START_TIMEOUT_MS = 4000L;
+    private static final long RTSP_START_TIMEOUT_MS = 10000L;
     private static final long RTSP_HEALTH_CHECK_INTERVAL_MS = 800L;
 
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
@@ -44,7 +43,7 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     private final CameraSearchIP cameraGateway = CameraSearchIP.ManageCamera();
     private final CameraVideoByRtsp rtspVideoGateway = CameraVideoByRtsp.ManageCamera();
     private ImageView carImage;
-    private VLCVideoLayout rtspPlayerView;
+    private SurfaceView rtspPlayerView;
     private volatile boolean previewRunning = false;
     private volatile boolean previewTaskSubmitted = false;
     private String cachedCameraIp = "";
@@ -55,6 +54,7 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     private volatile int activeRtspSessionId = 0;
     private volatile boolean rtspSessionStarting = false;
     private volatile long rtspSessionStartAtMs = 0L;
+    private volatile boolean rtspUseTcpForNextSession = FORCE_RTSP_INTERLEAVED_TCP;
 
     /**
      * 初始化页面、绑定视图并设置基础交互。
@@ -235,11 +235,18 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
                         continue;
                     }
 
+                    boolean timedOutWithoutError = !rtspErrored && startElapsed >= RTSP_START_TIMEOUT_MS;
+                    if (timedOutWithoutError && !rtspUseTcpForNextSession) {
+                        rtspUseTcpForNextSession = true;
+                        Log.w(TAG, "RTSP 启动超时，下一次改用 TCP 重试: sessionId=" + activeRtspSessionId);
+                    }
+
                     Log.w(TAG, "RTSP 会话异常，准备重建: sessionId=" + activeRtspSessionId
                             + ", elapsedMs=" + startElapsed
                             + ", playing=" + rtspVideoGateway.isPlaying()
                             + ", vout=" + rtspVideoGateway.hasVideoOutput()
-                            + ", error=" + rtspVideoGateway.hasPlaybackError());
+                            + ", error=" + rtspVideoGateway.hasPlaybackError()
+                            + ", nextTcp=" + rtspUseTcpForNextSession);
                     rtspSessionStarting = false;
                     stopRtspSession(activeRtspSessionId, rtspErrored ? "playback-error" : "start-timeout");
                     if (!hasShownLoadFailToast) {
@@ -301,7 +308,7 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
                     this,
                     rtspPlayerView,
                     rtspVideoGateway.getRtspUrl(),
-                    FORCE_RTSP_INTERLEAVED_TCP
+                    rtspUseTcpForNextSession
             );
         });
     }
@@ -327,6 +334,7 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
         hasShownSearchFailToast = false;
         hasShownLoadFailToast = false;
         rtspSessionStarting = false;
+        rtspUseTcpForNextSession = FORCE_RTSP_INTERLEAVED_TCP;
         Toast.makeText(this, R.string.camera_loading, Toast.LENGTH_SHORT).show();
         Log.i(TAG, "手动重启摄像头预览");
         stopPreview();

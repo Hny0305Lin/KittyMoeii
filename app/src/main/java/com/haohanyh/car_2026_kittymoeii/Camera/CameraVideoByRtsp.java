@@ -4,31 +4,22 @@ import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
-import android.net.NetworkInfo;
 import android.net.Uri;
 import android.util.Log;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import org.videolan.libvlc.LibVLC;
-import org.videolan.libvlc.Media;
-import org.videolan.libvlc.MediaPlayer;
-import org.videolan.libvlc.util.VLCVideoLayout;
-
-import java.util.ArrayList;
-
 /**
  * 摄像头 RTSP 串流播放器封装。
  *
- * <p>该类用于在 Android 端播放支持 RTSP 的摄像头视频流，默认串流地址为
- * {@code rtsp://192.168.31.100:10554/udp/av0_0}。当前实现基于 LibVLC，
- * 默认优先使用 RTP over UDP，与设备原始串流方式保持一致。</p>
+ * <p>该类已切换为 FFmpeg + JNI 实现，负责把 RTSP 视频流解码为 RGBA 后直接渲染到
+ * {@link SurfaceView} 对应的原生窗口。</p>
  *
- * <p>职责边界：</p>
- * <p>1. 管理 RTSP 地址、LibVLC 实例和界面绑定关系。</p>
- * <p>2. 对外提供启动、暂停、停止、释放以及切换传输方式等能力。</p>
- * <p>3. 统一封装 VLCVideoLayout 绑定与 RTSP 媒体选项配置逻辑。</p>
+ * <p>当前只处理视频轨，音频轨默认忽略，优先服务于小车摄像头实时预览。</p>
  */
 public class CameraVideoByRtsp {
     private static final String TAG = "CameraVideoByRtsp";
@@ -37,17 +28,19 @@ public class CameraVideoByRtsp {
     private static final String DEFAULT_RTSP_PASSWORD = "888888";
     private static final int DEFAULT_RTSP_PORT = 10554;
     private static final String DEFAULT_RTSP_PATH = "/udp/av0_0";
-    private static final int DEFAULT_NETWORK_CACHING_MS = 600;
-    private static final int DEFAULT_LIVE_CACHING_MS = 600;
 
     private static volatile CameraVideoByRtsp cameraVideoByRtsp;
 
-    private LibVLC libVLC;
-    private MediaPlayer mediaPlayer;
-    private VLCVideoLayout boundVideoLayout;
-    private boolean viewsAttached = false;
-    private boolean hasVideoOutput = false;
-    private boolean hasPlaybackError = false;
+    static {
+        System.loadLibrary("camera_ffmpeg_player");
+    }
+
+    private long nativeHandle = 0L;
+    private SurfaceView boundSurfaceView;
+    private SurfaceHolder.Callback surfaceCallback;
+    private boolean surfaceReady = false;
+    private boolean shouldPlayWhenSurfaceReady = false;
+    private boolean pendingForceUseTcp = false;
     private int debugSessionId = 0;
     private String currentUsername = DEFAULT_RTSP_USERNAME;
     private String currentPassword = DEFAULT_RTSP_PASSWORD;
@@ -116,7 +109,11 @@ public class CameraVideoByRtsp {
      * @param cameraIp 摄像头 IP 地址
      */
     public synchronized void setRtspIp(@Nullable String cameraIp) {
-        currentRtspUrl = buildRtspEndpoint(cameraIp == null ? DEFAULT_CAMERA_IP : cameraIp.trim().isEmpty() ? DEFAULT_CAMERA_IP : cameraIp.trim());
+        String resolvedIp = cameraIp == null ? DEFAULT_CAMERA_IP : cameraIp.trim();
+        if (resolvedIp.isEmpty()) {
+            resolvedIp = DEFAULT_CAMERA_IP;
+        }
+        currentRtspUrl = buildRtspEndpoint(resolvedIp);
     }
 
     /**
@@ -142,35 +139,35 @@ public class CameraVideoByRtsp {
      * 使用当前 RTSP 地址启动播放，默认走 RTP over UDP。
      *
      * @param context 上下文
-     * @param videoLayout VLC 视频视图
+     * @param surfaceView 视频输出视图
      */
-    public synchronized void start(@NonNull Context context, @NonNull VLCVideoLayout videoLayout) {
-        start(context, videoLayout, currentRtspUrl, false);
+    public synchronized void start(@NonNull Context context, @NonNull SurfaceView surfaceView) {
+        start(context, surfaceView, currentRtspUrl, false);
     }
 
     /**
      * 使用指定 RTSP 地址启动播放，默认走 RTP over UDP。
      *
      * @param context 上下文
-     * @param videoLayout VLC 视频视图
+     * @param surfaceView 视频输出视图
      * @param rtspUrl 完整 RTSP 地址
      */
     public synchronized void start(@NonNull Context context,
-                                   @NonNull VLCVideoLayout videoLayout,
+                                   @NonNull SurfaceView surfaceView,
                                    @Nullable String rtspUrl) {
-        start(context, videoLayout, rtspUrl, false);
+        start(context, surfaceView, rtspUrl, false);
     }
 
     /**
      * 启动 RTSP 播放。
      *
      * @param context 上下文
-     * @param videoLayout VLC 视频视图
+     * @param surfaceView 视频输出视图
      * @param rtspUrl 完整 RTSP 地址
-     * @param forceUseTcp {@code true} 表示强制 RTP over TCP，{@code false} 表示优先使用 UDP
+     * @param forceUseTcp {@code true} 表示强制 RTSP over TCP，{@code false} 表示优先使用 UDP
      */
     public synchronized void start(@NonNull Context context,
-                                   @NonNull VLCVideoLayout videoLayout,
+                                   @NonNull SurfaceView surfaceView,
                                    @Nullable String rtspUrl,
                                    boolean forceUseTcp) {
         String resolvedUrl = normalizeRtspUrl(rtspUrl);
@@ -180,51 +177,39 @@ public class CameraVideoByRtsp {
         }
 
         currentRtspUrl = resolvedUrl;
-        hasVideoOutput = false;
-        hasPlaybackError = false;
+        pendingForceUseTcp = forceUseTcp;
+        shouldPlayWhenSurfaceReady = true;
         bindProcessToWifiNetworkIfAvailable(context);
-        bindVideoLayout(videoLayout);
-        MediaPlayer player = ensurePlayer(context);
-        attachViewsIfNeeded();
-
-        Media media = buildMedia(currentRtspUrl, forceUseTcp);
-        player.setMedia(media);
-        media.release();
-        player.play();
-
-        Log.i(TAG, "RTSP 播放已启动: sessionId=" + debugSessionId
-                + ", url=" + maskRtspUrl(currentRtspUrl)
-                + ", forceUseTcp=" + forceUseTcp);
+        bindSurfaceView(surfaceView);
+        startNativeIfPossible();
     }
 
     /**
      * 暂停当前播放。
+     *
+     * <p>当前 FFmpeg 实现没有单独暂停能力，统一映射为停止拉流。</p>
      */
     public synchronized void pause() {
-        if (mediaPlayer != null) {
-            mediaPlayer.pause();
-        }
+        stop();
     }
 
     /**
      * 恢复当前播放。
+     *
+     * <p>当前 FFmpeg 实现由上层负责重启会话，因此此方法仅在已有可播放意图时重试启动。</p>
      */
     public synchronized void resume() {
-        if (mediaPlayer != null) {
-            mediaPlayer.play();
-        }
+        startNativeIfPossible();
     }
 
     /**
      * 停止当前播放并断开视频输出。
      */
     public synchronized void stop() {
-        if (mediaPlayer != null) {
-            mediaPlayer.stop();
+        shouldPlayWhenSurfaceReady = false;
+        if (nativeHandle != 0L) {
+            nativeStop(nativeHandle);
         }
-        detachViewsIfNeeded();
-        hasVideoOutput = false;
-        hasPlaybackError = false;
         Log.i(TAG, "RTSP 播放已停止: sessionId=" + debugSessionId);
     }
 
@@ -232,19 +217,12 @@ public class CameraVideoByRtsp {
      * 释放播放器资源并解除与界面的绑定。
      */
     public synchronized void release() {
-        detachViewsIfNeeded();
-
-        if (mediaPlayer != null) {
-            mediaPlayer.release();
-            mediaPlayer = null;
+        shouldPlayWhenSurfaceReady = false;
+        if (nativeHandle != 0L) {
+            nativeDestroy(nativeHandle);
+            nativeHandle = 0L;
         }
-        if (libVLC != null) {
-            libVLC.release();
-            libVLC = null;
-        }
-        boundVideoLayout = null;
-        hasVideoOutput = false;
-        hasPlaybackError = false;
+        unbindSurfaceView();
         Log.i(TAG, "RTSP 播放器资源已释放: sessionId=" + debugSessionId);
     }
 
@@ -254,16 +232,16 @@ public class CameraVideoByRtsp {
      * @return {@code true} 表示正在播放
      */
     public synchronized boolean isPlaying() {
-        return mediaPlayer != null && mediaPlayer.isPlaying();
+        return nativeHandle != 0L && nativeIsPlaying(nativeHandle);
     }
 
     /**
      * 当前是否已经创建视频输出。
      *
-     * @return {@code true} 表示 VLC 已创建 vout
+     * @return {@code true} 表示 native 层已经成功渲染过视频帧
      */
     public synchronized boolean hasVideoOutput() {
-        return hasVideoOutput;
+        return nativeHandle != 0L && nativeHasVideoOutput(nativeHandle);
     }
 
     /**
@@ -272,144 +250,123 @@ public class CameraVideoByRtsp {
      * @return {@code true} 表示最近一次播放过程中出现错误
      */
     public synchronized boolean hasPlaybackError() {
-        return hasPlaybackError;
-    }
-
-    /**
-     * 获取当前底层播放器实例。
-     *
-     * @return MediaPlayer 实例；如果尚未初始化则返回 {@code null}
-     */
-    @Nullable
-    public synchronized MediaPlayer getPlayer() {
-        return mediaPlayer;
+        return nativeHandle != 0L && nativeHasPlaybackError(nativeHandle);
     }
 
     /**
      * 绑定视频输出视图。
      *
-     * @param videoLayout VLC 视频视图
+     * @param surfaceView 视频输出视图
      */
-    private void bindVideoLayout(@NonNull VLCVideoLayout videoLayout) {
-        if (boundVideoLayout != videoLayout) {
-            detachViewsIfNeeded();
-            boundVideoLayout = videoLayout;
-        }
-    }
-
-    /**
-     * 确保 LibVLC 和 MediaPlayer 实例已初始化。
-     *
-     * @param context 上下文
-     * @return 可用的 VLC 播放器实例
-     */
-    @NonNull
-    private MediaPlayer ensurePlayer(@NonNull Context context) {
-        if (libVLC == null) {
-            ArrayList<String> options = new ArrayList<>();
-            options.add("--verbose=2");
-            libVLC = new LibVLC(context.getApplicationContext(), options);
-        }
-
-        if (mediaPlayer == null) {
-            mediaPlayer = new MediaPlayer(libVLC);
-            mediaPlayer.setEventListener(this::handlePlayerEvent);
-        }
-        return mediaPlayer;
-    }
-
-    /**
-     * 构建当前播放所需的 VLC 媒体对象。
-     *
-     * @param player VLC 播放器
-     * @param rtspUrl 完整 RTSP 地址
-     * @param forceUseTcp 是否强制使用 RTSP over TCP
-     * @return 已配置好的媒体对象
-     */
-    @NonNull
-    private Media buildMedia(@NonNull String rtspUrl,
-                             boolean forceUseTcp) {
-        Media media = new Media(libVLC, Uri.parse(rtspUrl));
-        media.setHWDecoderEnabled(false, false);
-        media.addOption(":network-caching=" + DEFAULT_NETWORK_CACHING_MS);
-        media.addOption(":live-caching=" + DEFAULT_LIVE_CACHING_MS);
-        media.addOption(":clock-jitter=5000");
-        media.addOption(":clock-synchro=1");
-        media.addOption(":ipv4");
-        media.addOption(":no-audio");
-        if (!currentUsername.isEmpty()) {
-            media.addOption(":rtsp-user=" + currentUsername);
-            media.addOption(":rtsp-pwd=" + currentPassword);
-        }
-        if (forceUseTcp) {
-            media.addOption(":rtsp-tcp");
-        }
-        return media;
-    }
-
-    /**
-     * 绑定 VLC 视频输出到界面。
-     */
-    private void attachViewsIfNeeded() {
-        if (mediaPlayer == null || boundVideoLayout == null || viewsAttached) {
-            return;
-        }
-        mediaPlayer.attachViews(boundVideoLayout, null, false, false);
-        viewsAttached = true;
-    }
-
-    /**
-     * 解除 VLC 视频输出与界面的绑定。
-     */
-    private void detachViewsIfNeeded() {
-        if (mediaPlayer == null || !viewsAttached) {
-            return;
-        }
-        mediaPlayer.detachViews();
-        viewsAttached = false;
-    }
-
-    /**
-     * 处理 VLC 播放器事件并输出可读日志。
-     *
-     * @param event VLC 播放事件
-     */
-    private void handlePlayerEvent(@Nullable MediaPlayer.Event event) {
-        if (event == null) {
+    private void bindSurfaceView(@NonNull SurfaceView surfaceView) {
+        if (boundSurfaceView == surfaceView) {
             return;
         }
 
-        switch (event.type) {
-            case MediaPlayer.Event.Opening:
-                Log.i(TAG, "RTSP 播放状态: sessionId=" + debugSessionId + ", state=OPENING");
-                break;
-            case MediaPlayer.Event.Buffering:
-                Log.i(TAG, "RTSP 播放状态: sessionId=" + debugSessionId + ", state=BUFFERING");
-                break;
-            case MediaPlayer.Event.Playing:
-                Log.i(TAG, "RTSP 播放状态: sessionId=" + debugSessionId + ", state=PLAYING");
-                break;
-            case MediaPlayer.Event.Paused:
-                Log.i(TAG, "RTSP 播放状态: sessionId=" + debugSessionId + ", state=PAUSED");
-                break;
-            case MediaPlayer.Event.Stopped:
-                Log.i(TAG, "RTSP 播放状态: sessionId=" + debugSessionId + ", state=STOPPED");
-                hasVideoOutput = false;
-                break;
-            case MediaPlayer.Event.EndReached:
-                Log.i(TAG, "RTSP 播放状态: sessionId=" + debugSessionId + ", state=END_REACHED");
-                hasVideoOutput = false;
-                break;
-            case MediaPlayer.Event.EncounteredError:
-                Log.e(TAG, "RTSP 播放异常: sessionId=" + debugSessionId + ", state=ENCOUNTERED_ERROR");
-                hasPlaybackError = true;
-                break;
-            case MediaPlayer.Event.Vout:
-                Log.i(TAG, "RTSP 已绑定视频输出: sessionId=" + debugSessionId);
-                hasVideoOutput = true;
-                break;
-            default:
-                break;
+        unbindSurfaceView();
+        boundSurfaceView = surfaceView;
+        ensureSurfaceCallback();
+        boundSurfaceView.getHolder().addCallback(surfaceCallback);
+        Surface surface = boundSurfaceView.getHolder().getSurface();
+        surfaceReady = surface != null && surface.isValid();
+    }
+
+    /**
+     * 解除与当前 SurfaceView 的绑定。
+     */
+    private void unbindSurfaceView() {
+        if (boundSurfaceView != null && surfaceCallback != null) {
+            boundSurfaceView.getHolder().removeCallback(surfaceCallback);
+        }
+        boundSurfaceView = null;
+        surfaceReady = false;
+    }
+
+    /**
+     * 确保 Surface 回调已创建。
+     */
+    private void ensureSurfaceCallback() {
+        if (surfaceCallback != null) {
+            return;
+        }
+
+        surfaceCallback = new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(@NonNull SurfaceHolder holder) {
+                synchronized (CameraVideoByRtsp.this) {
+                    surfaceReady = true;
+                    Log.i(TAG, "RTSP Surface 已创建: sessionId=" + debugSessionId);
+                    startNativeIfPossible();
+                }
+            }
+
+            @Override
+            public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
+                synchronized (CameraVideoByRtsp.this) {
+                    surfaceReady = holder.getSurface().isValid();
+                    Log.i(TAG, "RTSP Surface 已更新: sessionId=" + debugSessionId
+                            + ", size=" + width + "x" + height);
+                }
+            }
+
+            @Override
+            public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+                synchronized (CameraVideoByRtsp.this) {
+                    surfaceReady = false;
+                    if (nativeHandle != 0L) {
+                        nativeStop(nativeHandle);
+                    }
+                    Log.i(TAG, "RTSP Surface 已销毁: sessionId=" + debugSessionId);
+                }
+            }
+        };
+    }
+
+    /**
+     * 在 Surface 可用时启动 native RTSP 拉流。
+     */
+    private void startNativeIfPossible() {
+        if (!shouldPlayWhenSurfaceReady) {
+            return;
+        }
+        if (boundSurfaceView == null) {
+            Log.w(TAG, "RTSP 视图为空，无法启动 native 播放");
+            return;
+        }
+
+        Surface surface = boundSurfaceView.getHolder().getSurface();
+        if (!surfaceReady || surface == null || !surface.isValid()) {
+            Log.i(TAG, "RTSP Surface 尚未可用，等待重试: sessionId=" + debugSessionId);
+            return;
+        }
+
+        ensureNativeHandle();
+        nativeStop(nativeHandle);
+        boolean started = nativeStart(
+                nativeHandle,
+                currentRtspUrl,
+                surface,
+                currentUsername,
+                currentPassword,
+                pendingForceUseTcp
+        );
+        if (!started) {
+            Log.e(TAG, "RTSP native 启动失败: sessionId=" + debugSessionId
+                    + ", url=" + maskRtspUrl(currentRtspUrl));
+            return;
+        }
+
+        Log.i(TAG, "RTSP 播放已启动: sessionId=" + debugSessionId
+                + ", url=" + maskRtspUrl(currentRtspUrl)
+                + ", forceUseTcp=" + pendingForceUseTcp);
+    }
+
+    /**
+     * 确保 native 播放器句柄已创建。
+     */
+    private void ensureNativeHandle() {
+        if (nativeHandle == 0L) {
+            nativeHandle = nativeCreate();
         }
     }
 
@@ -509,4 +466,22 @@ public class CameraVideoByRtsp {
         return "rtsp://" + host + ":" + DEFAULT_RTSP_PORT + DEFAULT_RTSP_PATH;
     }
 
+    private native long nativeCreate();
+
+    private native void nativeDestroy(long nativeHandle);
+
+    private native boolean nativeStart(long nativeHandle,
+                                       @NonNull String rtspUrl,
+                                       @NonNull Surface surface,
+                                       @Nullable String username,
+                                       @Nullable String password,
+                                       boolean forceUseTcp);
+
+    private native void nativeStop(long nativeHandle);
+
+    private native boolean nativeIsPlaying(long nativeHandle);
+
+    private native boolean nativeHasVideoOutput(long nativeHandle);
+
+    private native boolean nativeHasPlaybackError(long nativeHandle);
 }

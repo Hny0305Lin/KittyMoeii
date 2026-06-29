@@ -1,6 +1,9 @@
 *.iml
 .gradle
 /local.properties
+local.properties
+/.idea/
+/.vscode/
 /.idea/caches
 /.idea/libraries
 /.idea/modules.xml
@@ -12,5 +15,27 @@
 /captures
 .externalNativeBuild
 .cxx
-local.properties
 /gradle/gradle-daemon-jvm.properties
+
+# Local build/debug artifacts
+/cmake-full-log.txt
+/hostcc_test.c
+/ndkbuild-*.txt
+*.status
+*.log
+
+# Third-party toolchains and FFmpeg build intermediates
+/third_party/toolchains/
+/third_party/ffmpegAndroid/.git/
+/third_party/ffmpegAndroid/.github/
+/third_party/ffmpegAndroid/ffmpeg/
+/third_party/ffmpegAndroid/ffmpeg-build/
+/third_party/ffmpegAndroid/armeabi-v7a/
+/third_party/ffmpegAndroid/x86/
+/third_party/ffmpegAndroid/x86_64/
+/third_party/ffmpegAndroid/arm64-v8a/lib/
+/third_party/ffmpegAndroid/arm64-v8a/share/
+/third_party/ffmpegAndroid/arm64-v8a/**/*.tmp*
+/third_party/ffmpegAndroid/*.status
+/third_party/ffmpegAndroid/*.log
+/third_party/ffmpegAndroid/bash_write_test.txt
