@@ -18,23 +18,35 @@ public class CarState {
     public void setByte(byte[] myByte){this.myByte = myByte;}
 
     public long getJiuYuan() {
+        if (myByte == null || myByte.length < 7) {
+            return 0;
+        }
         JiuYuan = myByte[6];
         return JiuYuan;
     }
 
     public long getUltraSonic() {
+        if (myByte == null || myByte.length < 6) {
+            return 0;
+        }
         UltraSonic = myByte[5] << 8;
         UltraSonic = UltraSonic | (myByte[4] & 0xff);
         return UltraSonic;
     }
 
     public long getLight() {
+        if (myByte == null || myByte.length < 4) {
+            return 0;
+        }
         Light = myByte[3] << 8;
         Light = Light | (myByte[2] & 0xff);
         return Light;
     }
 
     public long getCodeDisk() {
+        if (myByte == null || myByte.length < 2) {
+            return 0;
+        }
         CodeDisk = myByte[1] << 8;
         CodeDisk = CodeDisk | (myByte[0] & 0xff);
         return CodeDisk;

@@ -13,7 +13,7 @@ import java.util.List;
 public class CarCommandBySocket {
     /** 详情请打开如下文件：01-2022智能嵌入式实训系统通信协议v5.1.pdf
      * 在线下载地址：http://vs.r8c.com/?page_id=1103&path=2
-     * 阿里云OSS下载地址：https://bkrc-vk.oss-cn-beijing.aliyuncs.com/百科荣创大赛资源/资源下载/02-文档教程/01-2022智能嵌入式实训系统通信协议v5.1.pdf
+     * 阿里云OSS下载地址：https://bkrc-vk.oss-cn-beijing.aliyuncs.com/%E7%99%BE%E7%A7%91%E8%8D%A3%E5%88%9B%E5%A4%A7%E8%B5%9B%E8%B5%84%E6%BA%90/%E8%B5%84%E6%BA%90%E4%B8%8B%E8%BD%BD/02-%E6%96%87%E6%A1%A3%E6%95%99%E7%A8%8B/01-2024%E6%99%BA%E8%83%BD%E5%B5%8C%E5%85%A5%E5%BC%8F%E7%B3%BB%E7%BB%9F%E7%BB%BC%E5%90%88%E5%BA%94%E7%94%A8%E5%BC%80%E5%8F%91%E5%B9%B3%E5%8F%B0%E9%80%9A%E4%BF%A1%E5%8D%8F%E8%AE%AEv5.2.pdf?response-content-type=application%2Foctet-stream&OSSAccessKeyId=LTAI5tLkSjvFwtppP2qWWgdh&Expires=1782791505&Signature=RXE79Ez8u75BKuShcI4rDjnQpeo%3D
      * 怎么使用我呢？
      * 答：请import该类后实例化我：carCommandBySocket = new CarCommandBySocket();
      */
@@ -109,6 +109,7 @@ public class CarCommandBySocket {
      * @param en_n 码盘值
      */
     public void go(int sp_n, int en_n) {
+        TYPE = (byte) 0xAA;
         MAJOR = (byte) 0x02;FIRST = (byte) (sp_n & 0xFF);SECOND = (byte) (en_n & 0xFF);THRID = (byte) (en_n >> 8);
         sendSimple();
     }
@@ -118,6 +119,7 @@ public class CarCommandBySocket {
      * @param en_n 码盘值
      */
     public void back(int sp_n, int en_n) {
+        TYPE = (byte) 0xAA;
         MAJOR = (byte) 0x03;FIRST = (byte) (sp_n & 0xFF);SECOND = (byte) (en_n & 0xFF);THRID = (byte) (en_n >> 8);
         sendSimple();
     }
@@ -126,6 +128,7 @@ public class CarCommandBySocket {
      * @param sp_n 速度
      */
     public void left(int sp_n) {
+        TYPE = (byte) 0xAA;
         MAJOR = (byte) 0x04;FIRST = (byte) (sp_n & 0xFF);SECOND = (byte) 0x00;THRID = (byte) 0x00;
         sendSimple();
     }
@@ -134,6 +137,7 @@ public class CarCommandBySocket {
      * @param sp_n 速度
      */
     public void right(int sp_n) {
+        TYPE = (byte) 0xAA;
         MAJOR = (byte) 0x05;FIRST = (byte) (sp_n & 0xFF);SECOND = (byte) 0x00;THRID = (byte) 0x00;
         sendSimple();
     }
@@ -141,6 +145,7 @@ public class CarCommandBySocket {
     /** 停车，车车移动
      */
     public void stop() {
+        TYPE = (byte) 0xAA;
         MAJOR = (byte) 0x01;FIRST = (byte) 0x00;SECOND = (byte) 0x00;THRID = (byte) 0x00;
         sendSimple();
     }
@@ -149,6 +154,7 @@ public class CarCommandBySocket {
      * @param sp_n 速度
      */
     public void line(int sp_n) {
+        TYPE = (byte) 0xAA;
         MAJOR = 0x06;FIRST = (byte) (sp_n & 0xFF);SECOND = 0x00;THRID = 0x00;
         sendSimple();
     }
@@ -156,6 +162,7 @@ public class CarCommandBySocket {
     /** 清空码盘值，车车移动
      */
     public void clear() {
+        TYPE = (byte) 0xAA;
         MAJOR = 0x07;FIRST = 0x00;SECOND = 0x00;THRID = 0x00;
         sendSimple();
     }
@@ -165,6 +172,7 @@ public class CarCommandBySocket {
      * @param right 右灯
      */
     public void carlight(int left, int right) {
+        TYPE = (byte) 0xAA;
         MAJOR = 0x20;
         if (left == 1 && right == 1) {  //临时停车
             FIRST = 0x01;SECOND = 0x01;THRID = 0x00;
@@ -188,6 +196,7 @@ public class CarCommandBySocket {
     public void carbuzzer(int i) {
         if (i == 1) FIRST = 0x01;
         else if (i == 0) FIRST = 0x00;
+        TYPE = (byte) 0xAA;
         MAJOR = 0x29;SECOND = 0x00;THRID = 0x00;
         sendSimple();}
 

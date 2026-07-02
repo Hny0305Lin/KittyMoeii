@@ -29,6 +29,13 @@ public class CameraVideoByRtsp {
     private static final int DEFAULT_RTSP_PORT = 10554;
     private static final String DEFAULT_RTSP_PATH = "/udp/av0_0";
 
+    /**
+     * 解码帧回调：RGBA 字节按行存储，可直接用于构建 ARGB_8888 Bitmap。
+     */
+    public interface FrameCallback {
+        void onFrame(byte[] rgba, int width, int height);
+    }
+
     private static volatile CameraVideoByRtsp cameraVideoByRtsp;
 
     static {
@@ -41,7 +48,6 @@ public class CameraVideoByRtsp {
     private boolean surfaceReady = false;
     private boolean shouldPlayWhenSurfaceReady = false;
     private boolean pendingForceUseTcp = false;
-    private int debugSessionId = 0;
     private String currentUsername = DEFAULT_RTSP_USERNAME;
     private String currentPassword = DEFAULT_RTSP_PASSWORD;
     private String currentRtspUrl = buildRtspUrl(DEFAULT_CAMERA_IP);
@@ -114,15 +120,6 @@ public class CameraVideoByRtsp {
             resolvedIp = DEFAULT_CAMERA_IP;
         }
         currentRtspUrl = buildRtspEndpoint(resolvedIp);
-    }
-
-    /**
-     * 设置当前调试会话编号，便于对齐 Activity 与播放器日志。
-     *
-     * @param sessionId 当前 RTSP 会话编号
-     */
-    public synchronized void setDebugSessionId(int sessionId) {
-        debugSessionId = sessionId;
     }
 
     /**
@@ -210,7 +207,7 @@ public class CameraVideoByRtsp {
         if (nativeHandle != 0L) {
             nativeStop(nativeHandle);
         }
-        Log.i(TAG, "RTSP 播放已停止: sessionId=" + debugSessionId);
+        Log.i(TAG, "RTSP 播放已停止");
     }
 
     /**
@@ -223,7 +220,52 @@ public class CameraVideoByRtsp {
             nativeHandle = 0L;
         }
         unbindSurfaceView();
-        Log.i(TAG, "RTSP 播放器资源已释放: sessionId=" + debugSessionId);
+        Log.i(TAG, "RTSP 播放器资源已释放");
+    }
+
+    /**
+     * 注册解码帧回调，用于在不依赖 Surface 渲染的场景下做画面分析。
+     *
+     * @param callback 帧回调；传 {@code null} 表示清除
+     */
+    public synchronized void setFrameCallback(@Nullable FrameCallback callback) {
+        ensureNativeHandle();
+        nativeSetFrameCallback(nativeHandle, callback);
+    }
+
+    /**
+     * 清除已注册的解码帧回调。
+     */
+    public synchronized void clearFrameCallback() {
+        if (nativeHandle != 0L) {
+            nativeClearFrameCallback(nativeHandle);
+        }
+    }
+
+    /**
+     * 以无 Surface 模式启动 RTSP 拉流，仅通过 {@link #setFrameCallback(FrameCallback)} 回调帧。
+     *
+     * @param context 上下文
+     * @param rtspUrl 完整 RTSP 地址
+     * @param forceUseTcp {@code true} 表示强制 RTSP over TCP
+     */
+    public synchronized void startHeadless(@NonNull Context context,
+                                           @Nullable String rtspUrl,
+                                           boolean forceUseTcp) {
+        String resolvedUrl = normalizeRtspUrl(rtspUrl);
+        if (resolvedUrl == null) {
+            Log.w(TAG, "RTSP 地址为空，无法启动 headless 拉流");
+            return;
+        }
+        currentRtspUrl = resolvedUrl;
+        pendingForceUseTcp = forceUseTcp;
+        bindProcessToWifiNetworkIfAvailable(context);
+        ensureNativeHandle();
+        nativeStop(nativeHandle);
+        nativeStart(nativeHandle, currentRtspUrl, null,
+                currentUsername, currentPassword, pendingForceUseTcp);
+        Log.i(TAG, "RTSP headless 拉流已启动: url=" + maskRtspUrl(currentRtspUrl)
+                + ", forceUseTcp=" + pendingForceUseTcp);
     }
 
     /**
@@ -295,7 +337,7 @@ public class CameraVideoByRtsp {
             public void surfaceCreated(@NonNull SurfaceHolder holder) {
                 synchronized (CameraVideoByRtsp.this) {
                     surfaceReady = true;
-                    Log.i(TAG, "RTSP Surface 已创建: sessionId=" + debugSessionId);
+                    Log.i(TAG, "RTSP Surface 已创建");
                     startNativeIfPossible();
                 }
             }
@@ -304,8 +346,7 @@ public class CameraVideoByRtsp {
             public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
                 synchronized (CameraVideoByRtsp.this) {
                     surfaceReady = holder.getSurface().isValid();
-                    Log.i(TAG, "RTSP Surface 已更新: sessionId=" + debugSessionId
-                            + ", size=" + width + "x" + height);
+                    Log.i(TAG, "RTSP Surface 已更新: size=" + width + "x" + height);
                 }
             }
 
@@ -316,7 +357,7 @@ public class CameraVideoByRtsp {
                     if (nativeHandle != 0L) {
                         nativeStop(nativeHandle);
                     }
-                    Log.i(TAG, "RTSP Surface 已销毁: sessionId=" + debugSessionId);
+                    Log.i(TAG, "RTSP Surface 已销毁");
                 }
             }
         };
@@ -336,7 +377,7 @@ public class CameraVideoByRtsp {
 
         Surface surface = boundSurfaceView.getHolder().getSurface();
         if (!surfaceReady || surface == null || !surface.isValid()) {
-            Log.i(TAG, "RTSP Surface 尚未可用，等待重试: sessionId=" + debugSessionId);
+            Log.i(TAG, "RTSP Surface 尚未可用，等待重试");
             return;
         }
 
@@ -351,13 +392,11 @@ public class CameraVideoByRtsp {
                 pendingForceUseTcp
         );
         if (!started) {
-            Log.e(TAG, "RTSP native 启动失败: sessionId=" + debugSessionId
-                    + ", url=" + maskRtspUrl(currentRtspUrl));
+            Log.e(TAG, "RTSP native 启动失败: url=" + maskRtspUrl(currentRtspUrl));
             return;
         }
 
-        Log.i(TAG, "RTSP 播放已启动: sessionId=" + debugSessionId
-                + ", url=" + maskRtspUrl(currentRtspUrl)
+        Log.i(TAG, "RTSP 播放已启动: url=" + maskRtspUrl(currentRtspUrl)
                 + ", forceUseTcp=" + pendingForceUseTcp);
     }
 
@@ -484,4 +523,8 @@ public class CameraVideoByRtsp {
     private native boolean nativeHasVideoOutput(long nativeHandle);
 
     private native boolean nativeHasPlaybackError(long nativeHandle);
+
+    private native void nativeSetFrameCallback(long nativeHandle, FrameCallback callback);
+
+    private native void nativeClearFrameCallback(long nativeHandle);
 }

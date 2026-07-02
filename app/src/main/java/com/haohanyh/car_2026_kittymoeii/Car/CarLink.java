@@ -1,18 +1,23 @@
 package com.haohanyh.car_2026_kittymoeii.Car;
 
+import android.util.Log;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.Closeable;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
 
 public class CarLink {
+    private static final String TAG = "CarLink";
     private static volatile CarLink cl;
     private byte[] sByte = new byte[35];
     private List<Byte> listbyte = new ArrayList<>();
     private final int Port = 60000;
-    private BufferedOutputStream OS;
-    private BufferedInputStream IS;
+    private volatile Socket socket;
+    private volatile BufferedOutputStream OS;
+    private volatile BufferedInputStream IS;
     public int what = 0,subscript = 0,tag = 0;
 
     private CarLink() {
@@ -44,11 +49,17 @@ public class CarLink {
             @Override
             public void run() {
                 try {
-                    Socket socket = new Socket(WifiIp, Port);
-                    OS = new BufferedOutputStream(socket.getOutputStream());
-                    IS = new BufferedInputStream(socket.getInputStream(),8192);
-                    while (socket != null && !socket.isClosed()) {
+                    closeLink();
+                    Socket newSocket = new Socket(WifiIp, Port);
+                    socket = newSocket;
+                    OS = new BufferedOutputStream(newSocket.getOutputStream());
+                    IS = new BufferedInputStream(newSocket.getInputStream(),8192);
+                    while (isConnected()) {
                         subscript=IS.read(sByte);
+                        if (subscript == -1) {
+                            Log.w(TAG, "小车 Socket 输入流已结束");
+                            break;
+                        }
                         if(sByte[0]==(byte) 0x55&&sByte[subscript-1]!=(byte)0xbb){
                             if(tag==0){
                                 for(int i = 0;i<subscript;i++){
@@ -89,16 +100,10 @@ public class CarLink {
                             }
                         }
                     }
-                    IS.close();//优化网络体验，请先关闭BufferedInputStream避免大面积错误
-                    OS.close();
                 } catch (Exception e) {
                     e.printStackTrace();
-                    try {
-                        IS.close();//优化网络体验，请先关闭BufferedInputStream避免大面积错误
-                        OS.close();
-                    } catch (Exception e1) {
-                        e1.printStackTrace();
-                    }
+                } finally {
+                    closeLink();
                 }
             }
         }).start();
@@ -106,5 +111,37 @@ public class CarLink {
 
     public BufferedOutputStream getOS() {
         return OS;
+    }
+
+    public boolean isConnected() {
+        Socket currentSocket = socket;
+        return currentSocket != null
+                && currentSocket.isConnected()
+                && !currentSocket.isClosed()
+                && !currentSocket.isOutputShutdown()
+                && OS != null;
+    }
+
+    public synchronized void closeLink() {
+        closeQuietly(IS);
+        closeQuietly(OS);
+        closeQuietly(socket);
+        IS = null;
+        OS = null;
+        socket = null;
+        subscript = 0;
+        tag = 0;
+        listbyte.clear();
+    }
+
+    private void closeQuietly(Closeable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (Exception e) {
+            Log.w(TAG, "关闭资源失败", e);
+        }
     }
 }

@@ -1,12 +1,16 @@
 package com.haohanyh.car_2026_kittymoeii;
 
+import android.content.Intent;
 import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.SurfaceView;
 import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ImageView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.activity.EdgeToEdge;
@@ -15,11 +19,14 @@ import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
+import com.haohanyh.car_2026_kittymoeii.Car.CarCommandBySocket;
+import com.haohanyh.car_2026_kittymoeii.Car.CarControlNeedSpeedAndEncoder;
 import com.haohanyh.car_2026_kittymoeii.Car.CarIPBean;
 import com.haohanyh.car_2026_kittymoeii.Car.CarLink;
 import com.haohanyh.car_2026_kittymoeii.Car.CarState;
 import com.haohanyh.car_2026_kittymoeii.Camera.CameraSearchIP;
 import com.haohanyh.car_2026_kittymoeii.Camera.CameraVideoByRtsp;
+import com.haohanyh.car_2026_kittymoeii.trafficsign.TrafficSignActivity;
 
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -38,18 +45,37 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     private static final boolean FORCE_RTSP_INTERLEAVED_TCP = false;
     // 先尝试固定 IP，连不上时再回退到 UDP 搜索。
     private static final String DEFAULT_CAMERA_IP = "192.168.31.100";
-    private static final String DEFAULT_CAR_IP = DEFAULT_CAMERA_IP;
+    private static final String DEFAULT_CAR_IP = "192.168.31.254";
     private static final long CAMERA_REFRESH_INTERVAL_MS = 120L;
     private static final long RTSP_RETRY_INTERVAL_MS = 2500L;
     private static final long RTSP_START_TIMEOUT_MS = 10000L;
     private static final long RTSP_HEALTH_CHECK_INTERVAL_MS = 800L;
+    private static final long PREVIEW_RESTART_TIMEOUT_MS = 2500L;
+    private static final int DEFAULT_CONTROL_SPEED = 90;
+    private static final int DEFAULT_CONTROL_ENCODER = 500;
+    private static final int CAMERA_COMMAND_STEP = 1;
+    private static final int CAMERA_COMMAND_UP = 0;
+    private static final int CAMERA_COMMAND_DOWN = 2;
+    private static final int CAMERA_COMMAND_LEFT = 4;
+    private static final int CAMERA_COMMAND_RIGHT = 6;
+    private static final int CAMERA_COMMAND_RESET = 25;
 
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService controlExecutor = Executors.newSingleThreadExecutor();
     private final AtomicInteger rtspSessionCounter = new AtomicInteger(0);
     private final CameraSearchIP cameraGateway = CameraSearchIP.ManageCamera();
     private final CameraVideoByRtsp rtspVideoGateway = CameraVideoByRtsp.ManageCamera();
+    private final CarCommandBySocket carCommandGateway = new CarCommandBySocket();
+    private final CarControlNeedSpeedAndEncoder controlInputParser =
+            CarControlNeedSpeedAndEncoder.NeedManageData();
     private ImageView carImage;
     private SurfaceView rtspPlayerView;
+    private EditText speedInput;
+    private EditText encoderInput;
+    private Button carLightButton;
+    private Button carBuzzerButton;
+    private TextView controlStatusView;
+    private TextView cameraStatusView;
     private volatile boolean previewRunning = false;
     private volatile boolean previewTaskSubmitted = false;
     private String cachedCameraIp = "";
@@ -61,6 +87,8 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
     private volatile boolean rtspSessionStarting = false;
     private volatile long rtspSessionStartAtMs = 0L;
     private volatile boolean rtspUseTcpForNextSession = FORCE_RTSP_INTERLEAVED_TCP;
+    private boolean carLightEnabled = false;
+    private boolean carBuzzerEnabled = false;
 
     /**
      * 初始化页面、绑定视图并设置基础交互。
@@ -74,6 +102,12 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
         setContentView(R.layout.activity_main);
         carImage = findViewById(R.id.carImage);
         rtspPlayerView = findViewById(R.id.rtspPlayerView);
+        speedInput = findViewById(R.id.inputSpeed);
+        encoderInput = findViewById(R.id.inputEncoder);
+        carLightButton = findViewById(R.id.btnCarLight);
+        carBuzzerButton = findViewById(R.id.btnCarBuzzer);
+        controlStatusView = findViewById(R.id.tvControlStatus);
+        cameraStatusView = findViewById(R.id.tvCameraStatus);
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
             Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
@@ -83,6 +117,8 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
 
         carImage.setOnClickListener(v -> restartCameraPreview());
         rtspPlayerView.setOnClickListener(v -> restartCameraPreview());
+        bindControlPanel();
+        bindVisionTasks();
         applyPreviewMode();
         Toast.makeText(this, R.string.camera_refresh_hint, Toast.LENGTH_SHORT).show();
     }
@@ -138,6 +174,181 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
         carImage.setVisibility(isRtspPreviewEnabled() ? View.GONE : View.VISIBLE);
         rtspPlayerView.setVisibility(isRtspPreviewEnabled() ? View.VISIBLE : View.GONE);
         setImageEnabled(true);
+    }
+
+    /**
+     * 绑定交通控制卡片中的按钮交互。
+     */
+    private void bindControlPanel() {
+        updateToggleButtons();
+        updateControlStatus(getString(R.string.control_status_ready));
+        updateCameraStatus(getString(R.string.camera_status_idle));
+
+        findViewById(R.id.btnForward).setOnClickListener(v ->
+                runCarCommand("已发送前进指令", () ->
+                        carCommandGateway.go(resolveControlSpeed(), resolveControlEncoder())));
+        findViewById(R.id.btnBackward).setOnClickListener(v ->
+                runCarCommand("已发送后退指令", () ->
+                        carCommandGateway.back(resolveControlSpeed(), resolveControlEncoder())));
+        findViewById(R.id.btnLeft).setOnClickListener(v ->
+                runCarCommand("已发送左转指令", () ->
+                        carCommandGateway.left(resolveControlSpeed())));
+        findViewById(R.id.btnRight).setOnClickListener(v ->
+                runCarCommand("已发送右转指令", () ->
+                        carCommandGateway.right(resolveControlSpeed())));
+        findViewById(R.id.btnStop).setOnClickListener(v ->
+                runCarCommand("已发送停止指令", carCommandGateway::stop));
+        findViewById(R.id.btnAutoDrive).setOnClickListener(v ->
+                runCarCommand("已切换为自动驾驶", carCommandGateway::automatic));
+        findViewById(R.id.btnClearEncoder).setOnClickListener(v ->
+                runCarCommand("已发送清空码盘指令", carCommandGateway::clear));
+
+        carLightButton.setOnClickListener(v -> {
+            boolean nextState = !carLightEnabled;
+            boolean success = runCarCommand(nextState ? "已打开车灯" : "已关闭车灯",
+                    () -> carCommandGateway.carlight(nextState ? 1 : 0, nextState ? 1 : 0));
+            if (success) {
+                carLightEnabled = nextState;
+                updateToggleButtons();
+            }
+        });
+
+        carBuzzerButton.setOnClickListener(v -> {
+            boolean nextState = !carBuzzerEnabled;
+            boolean success = runCarCommand(nextState ? "已打开蜂鸣器" : "已关闭蜂鸣器",
+                    () -> carCommandGateway.carbuzzer(nextState ? 1 : 0));
+            if (success) {
+                carBuzzerEnabled = nextState;
+                updateToggleButtons();
+            }
+        });
+
+        findViewById(R.id.btnReconnectCar).setOnClickListener(v -> reconnectCarSocketLink());
+        findViewById(R.id.btnRefreshCamera).setOnClickListener(v -> {
+            updateControlStatus("正在刷新摄像头画面");
+            updateCameraStatus("正在刷新摄像头预览");
+            restartCameraPreview();
+        });
+        findViewById(R.id.btnSearchCamera).setOnClickListener(v -> {
+            updateControlStatus("正在重新搜索摄像头");
+            updateCameraStatus("正在重新搜索摄像头");
+            searchCameraPreview();
+        });
+        findViewById(R.id.btnCameraUp).setOnClickListener(v ->
+                runCameraCommand("已发送摄像头上移指令", CAMERA_COMMAND_UP));
+        findViewById(R.id.btnCameraDown).setOnClickListener(v ->
+                runCameraCommand("已发送摄像头下移指令", CAMERA_COMMAND_DOWN));
+        findViewById(R.id.btnCameraLeft).setOnClickListener(v ->
+                runCameraCommand("已发送摄像头左移指令", CAMERA_COMMAND_LEFT));
+        findViewById(R.id.btnCameraRight).setOnClickListener(v ->
+                runCameraCommand("已发送摄像头右移指令", CAMERA_COMMAND_RIGHT));
+        findViewById(R.id.btnCameraReset).setOnClickListener(v ->
+                runCameraCommand("已发送摄像头归位指令", CAMERA_COMMAND_RESET));
+    }
+
+    private void updateToggleButtons() {
+        carLightButton.setText(carLightEnabled
+                ? R.string.control_light_on
+                : R.string.control_light_off);
+        carBuzzerButton.setText(carBuzzerEnabled
+                ? R.string.control_buzzer_on
+                : R.string.control_buzzer_off);
+    }
+
+    private void bindVisionTasks() {
+        findViewById(R.id.btnTrafficSign).setOnClickListener(v ->
+                startActivity(new Intent(this, TrafficSignActivity.class)));
+    }
+
+    private boolean runCarCommand(String statusMessage, Runnable action) {
+        if (!isCarCommandReady()) {
+            reconnectCarSocketLink();
+            return false;
+        }
+
+        try {
+            action.run();
+            updateControlStatus(statusMessage);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "发送小车控制指令失败", e);
+            updateControlStatus("发送控制指令失败");
+            Toast.makeText(this, "发送控制指令失败", Toast.LENGTH_SHORT).show();
+            return false;
+        }
+    }
+
+    private boolean isCarCommandReady() {
+        return CarLink.getCarLink().isConnected();
+    }
+
+    private int resolveControlSpeed() {
+        String rawValue = speedInput.getText() == null
+                ? ""
+                : speedInput.getText().toString().trim();
+        try {
+            int parsedValue = rawValue.isEmpty() ? DEFAULT_CONTROL_SPEED : Integer.parseInt(rawValue);
+            if (parsedValue < 1 || parsedValue > 100) {
+                throw new NumberFormatException("speed out of range");
+            }
+            int speed = controlInputParser.getSpeed(String.valueOf(parsedValue));
+            speedInput.setText(String.valueOf(speed));
+            return speed;
+        } catch (NumberFormatException e) {
+            speedInput.setText(String.valueOf(DEFAULT_CONTROL_SPEED));
+            Toast.makeText(this, R.string.control_invalid_speed, Toast.LENGTH_SHORT).show();
+            return DEFAULT_CONTROL_SPEED;
+        }
+    }
+
+    private int resolveControlEncoder() {
+        String rawValue = encoderInput.getText() == null
+                ? ""
+                : encoderInput.getText().toString().trim();
+        try {
+            int parsedValue = rawValue.isEmpty() ? DEFAULT_CONTROL_ENCODER : Integer.parseInt(rawValue);
+            if (parsedValue < 1 || parsedValue > 65535) {
+                throw new NumberFormatException("encoder out of range");
+            }
+            int encoder = controlInputParser.getEncoder(String.valueOf(parsedValue));
+            encoderInput.setText(String.valueOf(encoder));
+            return encoder;
+        } catch (NumberFormatException e) {
+            encoderInput.setText(String.valueOf(DEFAULT_CONTROL_ENCODER));
+            Toast.makeText(this, R.string.control_invalid_encoder, Toast.LENGTH_SHORT).show();
+            return DEFAULT_CONTROL_ENCODER;
+        }
+    }
+
+    private void updateControlStatus(String statusMessage) {
+        runOnUiThread(() -> controlStatusView.setText(statusMessage));
+    }
+
+    private void updateCameraStatus(String statusMessage) {
+        runOnUiThread(() -> cameraStatusView.setText(statusMessage));
+    }
+
+    private void runCameraCommand(String statusMessage, int command) {
+        updateCameraStatus("正在发送云台指令");
+        controlExecutor.execute(() -> {
+            String cameraIp = resolveCameraIp();
+            if (cameraIp == null || cameraIp.trim().isEmpty()) {
+                updateCameraStatus("未搜索到摄像头，无法发送云台指令");
+                showToast(R.string.camera_search_failed);
+                return;
+            }
+
+            try {
+                cachedCameraIp = cameraIp.trim();
+                cameraGateway.setCameraIP(cachedCameraIp);
+                cameraGateway.getcommand(cachedCameraIp, command, CAMERA_COMMAND_STEP);
+                updateCameraStatus(statusMessage);
+            } catch (Exception e) {
+                Log.e(TAG, "发送摄像头控制指令失败", e);
+                updateCameraStatus("发送云台指令失败");
+                showToast(R.string.camera_load_failed);
+            }
+        });
     }
 
     private boolean isRtspPreviewEnabled() {
@@ -313,7 +524,6 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
             Log.i(TAG, "RTSP 主线程启动会话: sessionId=" + sessionId + ", ip=" + cameraIp);
             rtspVideoGateway.release();
             rtspVideoGateway.setRtspIp(cameraIp);
-            rtspVideoGateway.setDebugSessionId(sessionId);
             rtspVideoGateway.start(
                     this,
                     rtspPlayerView,
@@ -339,16 +549,47 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
      * <p>会清空缓存 IP、恢复固定 IP 优先策略，并触发一次重新加载。</p>
      */
     private void restartCameraPreview() {
-        cachedCameraIp = "";
-        shouldTryDefaultCameraIp = true;
-        hasShownSearchFailToast = false;
-        hasShownLoadFailToast = false;
-        rtspSessionStarting = false;
-        rtspUseTcpForNextSession = FORCE_RTSP_INTERLEAVED_TCP;
-        Toast.makeText(this, R.string.camera_loading, Toast.LENGTH_SHORT).show();
-        Log.i(TAG, "手动重启摄像头预览");
-        stopPreview();
-        startPreview();
+        restartCameraPreview(true);
+    }
+
+    private void searchCameraPreview() {
+        restartCameraPreview(false);
+    }
+
+    private void restartCameraPreview(boolean tryDefaultIpFirst) {
+        controlExecutor.execute(() -> {
+            cachedCameraIp = "";
+            shouldTryDefaultCameraIp = tryDefaultIpFirst;
+            hasShownSearchFailToast = false;
+            hasShownLoadFailToast = false;
+            rtspSessionStarting = false;
+            rtspUseTcpForNextSession = FORCE_RTSP_INTERLEAVED_TCP;
+            updateCameraStatus(tryDefaultIpFirst ? "正在刷新摄像头预览" : "正在重新搜索摄像头");
+            int messageResId = tryDefaultIpFirst
+                    ? R.string.camera_loading
+                    : R.string.control_camera_searching;
+            showToast(messageResId);
+            Log.i(TAG, tryDefaultIpFirst ? "手动重启摄像头预览" : "强制重新搜索摄像头并重启预览");
+            stopPreview();
+            if (!waitForPreviewTaskToFinish()) {
+                return;
+            }
+            startPreview();
+        });
+    }
+
+    private boolean waitForPreviewTaskToFinish() {
+        long deadline = SystemClock.elapsedRealtime() + PREVIEW_RESTART_TIMEOUT_MS;
+        while (previewTaskSubmitted && SystemClock.elapsedRealtime() < deadline) {
+            sleepQuietly(50);
+        }
+
+        if (previewTaskSubmitted) {
+            Log.w(TAG, "预览任务停止超时，放弃本次重启");
+            updateControlStatus("摄像头忙碌中，请稍后再试");
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -374,6 +615,18 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
         Log.i(TAG, "已启动小车 Socket 数据监听: " + carIp);
     }
 
+    private void reconnectCarSocketLink() {
+        if (isCarCommandReady()) {
+            updateControlStatus("小车链路已连接");
+            Toast.makeText(this, "小车链路已连接", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        carLinkStarted = false;
+        startCarSocketLink();
+        updateControlStatus("正在尝试连接小车");
+        Toast.makeText(this, R.string.control_car_connecting, Toast.LENGTH_SHORT).show();
+    }
+
     /**
      * 解析当前要使用的摄像头 IP。
      *
@@ -383,15 +636,15 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
      * @return 当前可用于拉取摄像头画面的 IP
      */
     private String resolveCameraIp() {
-        if (!cachedCameraIp.trim().isEmpty()) {
-            return cachedCameraIp.trim();
+        String resolvedCameraIp = cachedCameraIp == null ? "" : cachedCameraIp.trim();
+        if (resolvedCameraIp.isEmpty() && shouldTryDefaultCameraIp && !DEFAULT_CAMERA_IP.trim().isEmpty()) {
+            resolvedCameraIp = DEFAULT_CAMERA_IP.trim();
+            cameraGateway.setCameraIP(resolvedCameraIp);
         }
-        if (shouldTryDefaultCameraIp && !DEFAULT_CAMERA_IP.trim().isEmpty()) {
-            cachedCameraIp = DEFAULT_CAMERA_IP.trim();
-            cameraGateway.setCameraIP(cachedCameraIp);
-            return cachedCameraIp;
+        if (resolvedCameraIp.isEmpty()) {
+            resolvedCameraIp = cameraGateway.send();
         }
-        cachedCameraIp = cameraGateway.send();
+        cachedCameraIp = resolvedCameraIp == null ? "" : resolvedCameraIp.trim();
         return cachedCameraIp;
     }
 
@@ -476,12 +729,15 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
                 }
                 break;
             case 11:
-                if (bytes.length >= 9) {
-                    CarState.getCarState().setByte(Arrays.copyOfRange(bytes, 3, 9));
+                if (bytes.length >= 11) {
+                    // 11 字节状态帧格式: 55 AA [码盘2字节][光照2字节][超声波2字节][救援1字节][校验][BB]
+                    CarState.getCarState().setByte(Arrays.copyOfRange(bytes, 2, 9));
                     Log.i(TAG, "主车状态更新: codeDisk=" + CarState.getCarState().getCodeDisk()
                             + ", light=" + CarState.getCarState().getLight()
                             + ", ultraSonic=" + CarState.getCarState().getUltraSonic()
                             + ", rescue=" + CarState.getCarState().getJiuYuan());
+                } else {
+                    Log.w(TAG, "主车 11 字节状态帧长度不足: bytes=" + bytes.length + ", subscript=" + subscript);
                 }
                 break;
             case 20:
@@ -517,6 +773,7 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
         rtspVideoGateway.release();
         super.onDestroy();
         cameraExecutor.shutdownNow();
+        controlExecutor.shutdownNow();
     }
 
     /**
@@ -531,4 +788,5 @@ public class MainActivity extends AppCompatActivity implements CarLink.INFO {
             Thread.currentThread().interrupt();
         }
     }
+
 }

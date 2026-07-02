@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -74,17 +75,16 @@ public:
                bool forceUseTcp) {
         stop();
 
-        if (surface == nullptr) {
-            hasPlaybackError_.store(true);
-            logError("Surface 为空，无法启动 FFmpeg RTSP 播放");
-            return false;
-        }
-
-        ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, surface);
-        if (nativeWindow == nullptr) {
-            hasPlaybackError_.store(true);
-            logError("ANativeWindow 创建失败，无法启动 FFmpeg RTSP 播放");
-            return false;
+        ANativeWindow* nativeWindow = nullptr;
+        if (surface != nullptr) {
+            nativeWindow = ANativeWindow_fromSurface(env, surface);
+            if (nativeWindow == nullptr) {
+                hasPlaybackError_.store(true);
+                logError("ANativeWindow 创建失败，无法启动 FFmpeg RTSP 播放");
+                return false;
+            }
+        } else {
+            logInfo("未提供 Surface，将以帧回调模式运行（不渲染到窗口）");
         }
 
         {
@@ -124,6 +124,52 @@ public:
 
     bool hasPlaybackError() const {
         return hasPlaybackError_.load();
+    }
+
+    void setFrameCallback(JNIEnv* env, jobject listener) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        if (listenerRef_ != nullptr && env != nullptr) {
+            env->DeleteGlobalRef(listenerRef_);
+        }
+        listenerRef_ = nullptr;
+        onFrameMethod_ = nullptr;
+        callbackVm_ = nullptr;
+        lastCallbackTime_ = std::chrono::steady_clock::time_point();
+
+        if (listener == nullptr || env == nullptr) {
+            return;
+        }
+
+        if (env->GetJavaVM(&callbackVm_) != JNI_OK) {
+            logError("GetJavaVM 失败，无法注册帧回调");
+            return;
+        }
+        listenerRef_ = env->NewGlobalRef(listener);
+        if (listenerRef_ == nullptr) {
+            logError("NewGlobalRef 失败，无法注册帧回调");
+            return;
+        }
+        jclass cls = env->GetObjectClass(listener);
+        if (cls != nullptr) {
+            onFrameMethod_ = env->GetMethodID(cls, "onFrame", "([BII)V");
+            env->DeleteLocalRef(cls);
+        }
+        if (onFrameMethod_ == nullptr) {
+            logError("未找到帧回调方法 onFrame(byte[], int, int)");
+            env->DeleteGlobalRef(listenerRef_);
+            listenerRef_ = nullptr;
+            callbackVm_ = nullptr;
+        }
+    }
+
+    void clearFrameCallback(JNIEnv* env) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        if (listenerRef_ != nullptr && env != nullptr) {
+            env->DeleteGlobalRef(listenerRef_);
+        }
+        listenerRef_ = nullptr;
+        onFrameMethod_ = nullptr;
+        callbackVm_ = nullptr;
     }
 
 private:
@@ -251,17 +297,14 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (window_ == nullptr) {
-                hasPlaybackError_.store(true);
-                logError("渲染窗口为空");
-                goto cleanup;
+            if (window_ != nullptr) {
+                ANativeWindow_setBuffersGeometry(
+                        window_,
+                        codecContext->width,
+                        codecContext->height,
+                        WINDOW_FORMAT_RGBA_8888
+                );
             }
-            ANativeWindow_setBuffersGeometry(
-                    window_,
-                    codecContext->width,
-                    codecContext->height,
-                    WINDOW_FORMAT_RGBA_8888
-            );
         }
 
         {
@@ -385,37 +428,84 @@ private:
                 dstLinesize
         );
 
-        ANativeWindow_Buffer windowBuffer;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (window_ == nullptr) {
-                logError("渲染失败：ANativeWindow 为空");
-                return false;
-            }
-
-            if (ANativeWindow_lock(window_, &windowBuffer, nullptr) != 0) {
-                logError("ANativeWindow_lock 失败");
-                return false;
-            }
-        }
-
-        auto* dstPixels = static_cast<uint8_t*>(windowBuffer.bits);
-        int copyWidth = std::min(windowBuffer.stride * 4, dstLinesize[0]);
-        for (int y = 0; y < height; ++y) {
-            memcpy(
-                    dstPixels + y * windowBuffer.stride * 4,
-                    rgbaBuffer + y * dstLinesize[0],
-                    copyWidth
-            );
-        }
-
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (window_ != nullptr) {
-                ANativeWindow_unlockAndPost(window_);
+                ANativeWindow_Buffer windowBuffer;
+                if (ANativeWindow_lock(window_, &windowBuffer, nullptr) == 0) {
+                    auto* dstPixels = static_cast<uint8_t*>(windowBuffer.bits);
+                    int copyWidth = std::min(windowBuffer.stride * 4, dstLinesize[0]);
+                    for (int y = 0; y < height; ++y) {
+                        memcpy(
+                                dstPixels + y * windowBuffer.stride * 4,
+                                rgbaBuffer + y * dstLinesize[0],
+                                copyWidth
+                        );
+                    }
+                    ANativeWindow_unlockAndPost(window_);
+                } else {
+                    logError("ANativeWindow_lock 失败");
+                }
             }
         }
+
+        maybeNotifyFrame(rgbaBuffer, width, height);
         return true;
+    }
+
+    void maybeNotifyFrame(uint8_t* rgba, int width, int height) {
+        JavaVM* vm = nullptr;
+        JNIEnv* env = nullptr;
+        bool attached = false;
+        {
+            // 整个 Java 调用期间持锁，确保 clearFrameCallback/setFrameCallback
+            // 不会在回调执行过程中删除或替换全局引用，消除 use-after-free。
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            if (listenerRef_ == nullptr || callbackVm_ == nullptr || onFrameMethod_ == nullptr) {
+                return;
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastCallbackTime_).count();
+            if (elapsedMs < callbackThrottleMs_) {
+                return;
+            }
+            lastCallbackTime_ = now;
+
+            vm = callbackVm_;
+            if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+                if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+                    return;
+                }
+                attached = true;
+            }
+            if (env == nullptr) {
+                return;
+            }
+
+            // 重新检查：Attach 之后仍可能已被清除。
+            if (listenerRef_ == nullptr || onFrameMethod_ == nullptr) {
+                if (attached) {
+                    vm->DetachCurrentThread();
+                }
+                return;
+            }
+
+            jsize size = static_cast<jsize>(width) * height * 4;
+            jbyteArray array = env->NewByteArray(size);
+            if (array != nullptr) {
+                env->SetByteArrayRegion(array, 0, size, reinterpret_cast<const jbyte*>(rgba));
+                env->CallVoidMethod(listenerRef_, onFrameMethod_, array, width, height);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                }
+                env->DeleteLocalRef(array);
+            }
+        }
+        if (attached && vm != nullptr) {
+            vm->DetachCurrentThread();
+        }
     }
 
     void releaseWindow() {
@@ -435,6 +525,13 @@ private:
     ANativeWindow* window_ = nullptr;
     std::string rtspUrl_;
     bool forceUseTcp_ = false;
+
+    std::mutex callbackMutex_;
+    JavaVM* callbackVm_ = nullptr;
+    jobject listenerRef_ = nullptr;
+    jmethodID onFrameMethod_ = nullptr;
+    std::chrono::steady_clock::time_point lastCallbackTime_;
+    int callbackThrottleMs_ = 120;
 };
 
 jlong nativeCreate(JNIEnv*, jobject) {
@@ -442,9 +539,14 @@ jlong nativeCreate(JNIEnv*, jobject) {
     return reinterpret_cast<jlong>(player);
 }
 
-void nativeDestroy(JNIEnv*, jobject, jlong nativeHandle) {
+void nativeDestroy(JNIEnv* env, jobject, jlong nativeHandle) {
     auto* player = reinterpret_cast<FfmpegRtspPlayer*>(nativeHandle);
-    delete player;
+    if (player != nullptr) {
+        // 先 join 解码线程，确保没有回调在执行，再清除回调全局引用。
+        player->stop();
+        player->clearFrameCallback(env);
+        delete player;
+    }
 }
 
 jboolean nativeStart(JNIEnv* env,
@@ -456,7 +558,7 @@ jboolean nativeStart(JNIEnv* env,
                      jstring password,
                      jboolean forceUseTcp) {
     auto* player = reinterpret_cast<FfmpegRtspPlayer*>(nativeHandle);
-    if (player == nullptr || rtspUrl == nullptr || surface == nullptr) {
+    if (player == nullptr || rtspUrl == nullptr) {
         return JNI_FALSE;
     }
 
@@ -490,6 +592,20 @@ void nativeStop(JNIEnv*, jobject, jlong nativeHandle) {
     auto* player = reinterpret_cast<FfmpegRtspPlayer*>(nativeHandle);
     if (player != nullptr) {
         player->stop();
+    }
+}
+
+void nativeSetFrameCallback(JNIEnv* env, jobject, jlong nativeHandle, jobject listener) {
+    auto* player = reinterpret_cast<FfmpegRtspPlayer*>(nativeHandle);
+    if (player != nullptr) {
+        player->setFrameCallback(env, listener);
+    }
+}
+
+void nativeClearFrameCallback(JNIEnv* env, jobject, jlong nativeHandle) {
+    auto* player = reinterpret_cast<FfmpegRtspPlayer*>(nativeHandle);
+    if (player != nullptr) {
+        player->clearFrameCallback(env);
     }
 }
 
@@ -568,4 +684,21 @@ Java_com_haohanyh_car_12026_1kittymoeii_Camera_CameraVideoByRtsp_nativeHasPlayba
         jobject thiz,
         jlong nativeHandle) {
     return nativeHasPlaybackError(env, thiz, nativeHandle);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_haohanyh_car_12026_1kittymoeii_Camera_CameraVideoByRtsp_nativeSetFrameCallback(
+        JNIEnv* env,
+        jobject thiz,
+        jlong nativeHandle,
+        jobject listener) {
+    nativeSetFrameCallback(env, thiz, nativeHandle, listener);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_haohanyh_car_12026_1kittymoeii_Camera_CameraVideoByRtsp_nativeClearFrameCallback(
+        JNIEnv* env,
+        jobject thiz,
+        jlong nativeHandle) {
+    nativeClearFrameCallback(env, thiz, nativeHandle);
 }
